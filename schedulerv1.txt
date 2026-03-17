@@ -1,0 +1,560 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+
+#define MAX_LINE_LENGTH 80
+
+#define PROC_NEW 0
+#define PROC_STOPPED 1
+#define PROC_RUNNING 2
+#define PROC_EXITED 3
+
+#define FCFS 0
+#define RR 1
+#define FCFS_PNP 2   
+#define FCFS_PRIO 3
+
+
+typedef struct proc_desc {
+	struct proc_desc *next;
+	char name[80];
+    int priority;
+	int pid;
+	int status;
+	double t_submission, t_start, t_end;
+} proc_t;
+
+struct single_queue {
+	proc_t	*first;
+	proc_t	*last;
+	long members;
+};
+
+struct single_queue global_q;
+int policy = FCFS;
+int quantum = 100;    /* ms */
+proc_t *running_proc = NULL;
+double global_t;
+
+/* --- PROTOTYPES --- */
+void fcfs(FILE *input); 
+void fcfs_pnp(FILE *input);
+void fcfs_prio(FILE *input);
+void rr();
+proc_t *pick_next_process();
+void execute_process(proc_t *proc);
+void stop_process(proc_t *proc);
+void err_exit(char *msg);
+/* Πρόσθεσε αυτή τη γραμμή κάτω από τα άλλα prototypes */
+void sigchld_handler(int signo, siginfo_t *info, void *context);
+
+
+#define proc_queue_empty(q) ((q)->first==NULL)
+
+void proc_queue_init (register struct single_queue * q)
+{
+	q->first = q->last = NULL;
+	q->members = 0;
+}
+
+void proc_to_rq (register proc_t *proc)
+{
+	if (proc_queue_empty (&global_q))
+		global_q.last = proc;
+	proc->next = global_q.first;
+	global_q.first = proc;
+}
+
+void proc_to_rq_end (register proc_t *proc)
+{
+	if (proc_queue_empty (&global_q))
+		global_q.first = global_q.last = proc;
+	else {
+		global_q.last->next = proc;
+		global_q.last = proc;
+		proc->next = NULL;
+	}
+}
+
+proc_t *proc_rq_dequeue ()
+{
+	register proc_t *proc;
+
+	proc = global_q.first;
+	if (proc==NULL) return NULL;
+
+	proc = global_q.first;
+	if (proc!=NULL) {
+		global_q.first = proc->next;
+		proc->next = NULL;
+	}
+
+	return proc;
+}
+
+proc_t *proc_rq_dequeue_highest_prior(){
+    proc_t *proc = global_q.first;
+    proc_t *prev = NULL;
+    proc_t *highest = NULL;
+    proc_t *prev_highest = NULL;
+    int max_priority = -1;
+
+    if(proc==NULL) return NULL;
+
+    while(proc != NULL){
+       if((proc->status == PROC_NEW || proc->status == PROC_STOPPED) && proc->priority > max_priority){
+            max_priority = proc->priority;
+            highest = proc;
+            prev_highest = prev;
+
+        }
+        prev = proc;
+        proc = proc -> next;
+    }
+
+    if(highest == NULL) return NULL; //den yparxei NEW 
+
+    if(highest == global_q.first){
+        global_q.first = highest->next;
+    }
+    else{
+        prev_highest -> next = highest -> next;
+    }
+    if(highest == global_q.last){
+        global_q.last = prev_highest;
+    }
+    highest -> next = NULL;
+    return highest;
+}
+
+
+void print_queue()
+{
+	proc_t *proc;
+
+	proc = global_q.first;
+	while (proc != NULL) {
+		printf("proc: [name:%s pid:%d]\n", 
+			proc->name, proc->pid);
+			proc = proc->next;
+	}
+}
+
+double proc_gettime()
+{
+	struct timeval tv;
+	gettimeofday(&tv, 0);
+	return (double) (tv.tv_sec+tv.tv_usec/1000000.0);
+}
+
+
+void err_exit(char *msg)
+{
+	printf("Error: %s\n", msg);
+	exit(1);
+}
+
+
+int main(int argc,char **argv) {
+    FILE *input;
+    
+    if (argc < 2) err_exit("invalid usage");
+
+    if (argc >= 2) {
+        if (!strcmp(argv[1],"FCFS")) {
+            policy = FCFS;
+            input = fopen(argv[2],"r");
+            if (input == NULL) err_exit("invalid input file name");
+        } else if (!strcmp(argv[1], "FCFS_PNP")) { 
+            policy = FCFS_PNP;
+            input = fopen(argv[2], "r");
+            if (input == NULL) err_exit("invalid input file name");
+        } else if (!strcmp(argv[1], "FCFS_PRIO")) { 
+            policy = FCFS_PRIO;
+            input = fopen(argv[2], "r");
+            if (input == NULL) err_exit("invalid input file name");
+        } else if (!strcmp(argv[1],"RR")) {
+            policy = RR;
+            quantum = atoi(argv[2]);
+            input = fopen(argv[3],"r");
+            if (input == NULL) err_exit("invalid input file name");
+        } else {
+            err_exit("invalid usage");
+        }
+    }
+
+    proc_queue_init(&global_q);
+    global_t = proc_gettime();
+
+    switch (policy) {
+        case FCFS:
+        case FCFS_PNP:
+            fcfs_pnp(input);
+            break;
+        case FCFS_PRIO:
+            fcfs_prio(input);
+            break;
+        case RR:
+            rr();
+            break;
+        default:
+            err_exit("Unimplemented policy");
+            break;
+    }
+
+    printf("WORKLOAD TIME: %.2lf secs\n", proc_gettime()-global_t);
+    printf("scheduler exits\n");
+    return 0;
+}
+
+
+void sigchld_handler(int signo, siginfo_t *info, void *context) {
+
+    if(policy == FCFS_PNP|| policy==FCFS){
+        return;
+    }
+    if (signo == SIGCHLD) {
+        // Ελέγχουμε αν ο τερματισμός αφορά την τρέχουσα διεργασία μας
+        if (running_proc != NULL && running_proc->pid == info->si_pid) {
+            // Αν το παιδί τερμάτισε (EXITED) ή σκοτώθηκε (KILLED)
+            if (info->si_code == CLD_EXITED || info->si_code == CLD_KILLED) {
+                
+                running_proc->status = PROC_EXITED;
+                proc_t *proc = running_proc;
+                proc->t_end = proc_gettime();
+                
+                printf("PID %d - CMD: %s [Priority: %d]\n", proc->pid, proc->name, proc->priority);
+                printf("\tElapsed time = %.2lf secs\n", proc->t_end - proc->t_submission);
+                printf("\tWorkload time = %.2lf secs\n", proc->t_end - global_t);
+
+                running_proc = NULL; // Ελευθερώνουμε τον επεξεργαστή
+                
+            }
+        }
+    }
+}
+
+void execute_process(proc_t *proc) {
+    int pid, status;
+
+    /* ΠΕΡΙΠΤΩΣΗ 1: ΝΕΑ ΔΙΕΡΓΑΣΙΑ */
+    if (proc->status == PROC_NEW) {
+        proc->t_start = proc_gettime();
+        pid = fork();
+
+        if (pid == -1) err_exit("fork failed");
+
+        if (pid == 0) { // Child
+            execl(proc->name, proc->name, NULL);
+            perror("execl failed");
+            exit(1);
+        } else { // Parent
+            proc->pid = pid;
+            proc->status = PROC_RUNNING;
+            running_proc = proc;
+            printf("[%.2f] START: %s (PID: %d)\n", proc_gettime() - global_t, proc->name, proc->pid);
+
+            /* ΑΝ ΕΙΝΑΙ PNP: Περιμένουμε να τελειώσει (Blocking) */
+            if (policy == FCFS_PNP || policy == FCFS) {
+                waitpid(pid, &status, 0);
+                
+                proc->status = PROC_EXITED;
+                proc->t_end = proc_gettime();
+                
+                printf("[%.2f] FINISHED: %s (PID: %d)\n", proc->t_end - global_t, proc->name, proc->pid);
+                printf("PID %d - CMD: %s [Priority: %d]\n", pid, proc->name, proc->priority);
+                printf("\tElapsed time = %.2lf secs\n", proc->t_end - proc->t_submission);
+                printf("\tWorkload time = %.2lf secs\n", proc->t_end - global_t);
+                
+                running_proc = NULL;
+                free(proc);
+            }
+            /* ΑΝ ΕΙΝΑΙ PRIO/RR: Δεν περιμένουμε, επιστρέφουμε αμέσως */
+        }
+    }
+    /* ΠΕΡΙΠΤΩΣΗ 2: ΣΤΑΜΑΤΗΜΕΝΗ ΔΙΕΡΓΑΣΙΑ */
+    else if (proc->status == PROC_STOPPED) {
+        kill(proc->pid, SIGCONT);
+        proc->status = PROC_RUNNING;
+        running_proc = proc;
+        printf("[%.2f] RESUME: %s (PID: %d)\n", proc_gettime() - global_t, proc->name, proc->pid);
+    }
+}
+
+proc_t* pick_next_process() {
+    if (policy == FCFS_PNP || policy == FCFS_PRIO) {
+        return proc_rq_dequeue_highest_prior();
+    } else {
+        return proc_rq_dequeue();
+    }
+}
+
+
+void fcfs(FILE *input)
+{
+	proc_t *proc;
+	int pid;
+	int status;
+
+	while ((proc=proc_rq_dequeue()) != NULL) {
+		// printf("Dequeued process with name %s\n", proc->name);
+		if (proc->status == PROC_NEW) {
+			proc->t_start = proc_gettime();
+			pid = fork();
+			if (pid == -1) {
+				err_exit("fork failed!");
+			}
+			if (pid == 0) {
+				printf("executing %s\n", proc->name);
+				execl(proc->name, proc->name, NULL);
+			} else {
+				proc->pid = pid;
+				proc->status = PROC_RUNNING;
+				pid = waitpid(proc->pid, &status, 0);
+				proc->status = PROC_EXITED;
+				if (pid < 0) err_exit("waitpid failed");
+				proc->t_end = proc_gettime();
+				printf("PID %d - CMD: %s\n", pid, proc->name);
+				printf("\tElapsed time = %.2lf secs\n", proc->t_end-proc->t_submission);
+				printf("\tExecution time = %.2lf secs\n", proc->t_end-proc->t_start);
+				printf("\tWorkload time = %.2lf secs\n", proc->t_end-global_t);
+			}
+		}
+	}
+}
+
+void fcfs_pnp(FILE *input) {
+    char exec[80];
+    proc_t *proc;
+    int priority;
+
+    /* ΒΡΟΧΟΣ ΑΝΑΓΝΩΣΗΣ ΑΡΧΕΙΟΥ */
+    while (fscanf(input, "%s", exec) != EOF) {
+        
+        /* ΠΕΡΙΠΤΩΣΗ 1: Εντολή SLEEP */
+        if (strcmp(exec, "sleep") == 0) {
+            int seconds;
+            fscanf(input, "%d", &seconds);
+            
+            /* Λογική: Περιμένουμε για 'seconds' χρόνο.
+               ΟΣΟ περιμένουμε, αν η ουρά έχει διεργασίες, τις εκτελούμε! */
+            double target_time = proc_gettime() + (double)seconds;
+            
+            while (proc_gettime() < target_time) {
+                proc = pick_next_process();
+                if (proc != NULL) {
+                    execute_process(proc);
+                } else {
+                    /* Αν η ουρά είναι άδεια, απλά περιμένουμε λίγο για να μην καίμε CPU */
+                    usleep(10000); // 10ms
+                }
+            }
+        } 
+        /* ΠΕΡΙΠΤΩΣΗ 2: ΝΕΑ ΔΙΕΡΓΑΣΙΑ */
+        else {
+            fscanf(input, "%d", &priority); // Διάβασμα προτεραιότητας [cite: 153]
+
+            proc = malloc(sizeof(proc_t));
+            proc->next = NULL;
+            strcpy(proc->name, exec);
+            proc->priority = priority;
+            proc->pid = -1;
+            proc->status = PROC_NEW;
+            proc->t_submission = proc_gettime(); // Χρόνος υποβολής
+
+            proc_to_rq_end(proc); // Εισαγωγή στην ουρά
+        }
+    }
+
+    /* Αφού τελειώσει το αρχείο, αδειάζουμε ότι έμεινε στην ουρά */
+    while ((proc = pick_next_process()) != NULL) {
+        execute_process(proc);
+    }
+}
+
+/* FCFS με Προτεραιότητες και Προεκχώρηση */
+void fcfs_prio(FILE *input) {
+    char exec[80];
+    int priority, seconds;
+    proc_t *proc;
+    
+    /* 1. Ρύθμιση Signal Handler με SA_RESTART
+     * Είναι απαραίτητο για να μην διακόπτεται η fscanf από τα σήματα SIGCHLD
+     * όταν τερματίζουν οι διεργασίες.
+     */
+    struct sigaction sig_act;
+    sigemptyset(&sig_act.sa_mask);
+    sig_act.sa_handler = 0;
+    sig_act.sa_flags = SA_SIGINFO | SA_NOCLDSTOP | SA_RESTART;
+    sig_act.sa_sigaction = sigchld_handler;
+    sigaction(SIGCHLD, &sig_act, NULL);
+
+    /* 2. Βρόχος Ανάγνωσης Αρχείου */
+    while (fscanf(input, "%s", exec) != EOF) {
+        
+        /* ΠΕΡΙΠΤΩΣΗ Α: Εντολή SLEEP */
+        if (strcmp(exec, "sleep") == 0) {
+            fscanf(input, "%d", &seconds);
+            double target_time = proc_gettime() + (double)seconds;
+            
+            /* Περιμένουμε να περάσει ο χρόνος.
+             * Επειδή είμαστε σε Non-Blocking mode, πρέπει να ελέγχουμε διαρκώς
+             * αν υπάρχει δουλειά να γίνει όσο περιμένουμε.
+             */
+            while (proc_gettime() < target_time) {
+                // Αν δεν τρέχει τίποτα, βρες την επόμενη και ξεκίνα την
+                if (running_proc == NULL) {
+                    proc_t *next = pick_next_process();
+                    if (next != NULL) {
+                        execute_process(next);
+                    }
+                }
+                usleep(10000); // Μικρή καθυστέρηση (10ms) για να μην καίμε CPU
+            }
+        } 
+        
+        /* ΠΕΡΙΠΤΩΣΗ Β: ΝΕΑ ΔΙΕΡΓΑΣΙΑ */
+        else {
+            fscanf(input, "%d", &priority);
+            
+            // Δημιουργία και αρχικοποίηση
+            proc = malloc(sizeof(proc_t));
+            proc->next = NULL;
+            strcpy(proc->name, exec);
+            proc->priority = priority;
+            proc->pid = -1;
+            proc->status = PROC_NEW;
+            proc->t_submission = proc_gettime();
+
+            // Βάζουμε τη διεργασία στην ουρά ΠΡΙΝ κάνουμε οποιονδήποτε έλεγχο
+            proc_to_rq_end(proc);
+            printf("[%.2f] NEW: %s [Prio: %d] added.\n", proc_gettime() - global_t, proc->name, proc->priority);
+            print_queue();
+            
+            /* ΕΛΕΓΧΟΣ ΠΡΟΕΚΧΩΡΗΣΗΣ (PREEMPTION) */
+            if (running_proc != NULL) {
+                // Αν η νέα διεργασία έχει μεγαλύτερη προτεραιότητα από αυτή που τρέχει
+                if (proc->priority > running_proc->priority) {
+                    // Σταματάμε την τρέχουσα (Preempt)
+                    stop_process(running_proc);
+                    
+                    // Ζητάμε την επόμενη καλύτερη (που θα είναι η 'proc' ή κάποια ακόμη καλύτερη)
+                    proc_t *next = pick_next_process(); 
+                    if (next != NULL) execute_process(next);
+                }
+            } else {
+                // Αν δεν τρέχει τίποτα, ξεκινάμε αμέσως την καλύτερη διαθέσιμη
+                proc_t *next = pick_next_process();
+                if (next != NULL) execute_process(next);
+            }
+        }
+    }
+
+    /* 3. Τερματισμός - Άδειασμα Ουράς */
+    /* Περιμένουμε να τελειώσουν όλες οι διεργασίες που έχουν απομείνει */
+    while (1) {
+        // Αν δεν τρέχει τίποτα, προσπαθούμε να πάρουμε την επόμενη
+        if (running_proc == NULL) {
+            // Αν η ουρά είναι άδεια, τελειώσαμε
+            if (proc_queue_empty(&global_q)) break; 
+            
+            proc_t *next = pick_next_process();
+            if (next != NULL) execute_process(next);
+        }
+        usleep(10000); // Περιμένουμε λίγο πριν ξαναελέγξουμε
+    }
+}
+
+
+
+void stop_process(proc_t *proc) {
+    if (proc != NULL && proc->status == PROC_RUNNING) {
+        kill(proc->pid, SIGSTOP);   // Στέλνουμε σήμα παύσης
+        printf("[%.2f] PAUSE (Preempt): %s (PID: %d)\n", proc_gettime() - global_t, proc->name, proc->pid); 
+        print_queue();
+        proc->status = PROC_STOPPED; // Αλλάζουμε κατάσταση
+        running_proc = NULL;         // Κανείς δεν τρέχει τώρα
+        proc_to_rq_end(proc);        // Την ξαναβάζουμε στην ουρά
+    }
+}
+
+void rr()
+{
+	struct sigaction sig_act;
+	proc_t *proc;
+	int pid;
+	struct timespec req, rem;
+
+	req.tv_sec = quantum / 1000;
+	req.tv_nsec = (quantum % 1000)*1000000;
+
+	printf("tv_sec = %ld\n", req.tv_sec);
+	printf("tv_nsec = %ld\n", req.tv_nsec);
+
+	sigemptyset(&sig_act.sa_mask);
+	sig_act.sa_handler = 0;
+	sig_act.sa_flags = SA_SIGINFO | SA_NOCLDSTOP;
+	sig_act.sa_sigaction = sigchld_handler;
+	sigaction (SIGCHLD,&sig_act,NULL);
+
+	while ((proc=proc_rq_dequeue()) != NULL) {
+		// printf("Dequeue process with name %s and pid %d\n", proc->name, proc->pid);
+		if (proc->status == PROC_NEW) {
+			proc->t_start = proc_gettime();
+			pid = fork();
+			if (pid == -1) {
+				err_exit("fork failed!");
+			}
+			if (pid == 0) {
+				printf("executing %s\n", proc->name);
+				execl(proc->name, proc->name, NULL);
+			}
+			else {
+				proc->pid = pid;
+				running_proc = proc;
+				proc->status = PROC_RUNNING;
+
+				nanosleep(&req, &rem);
+				if (proc->status == PROC_RUNNING) {
+					kill(proc->pid, SIGSTOP);
+					proc->status = PROC_STOPPED;
+					proc_to_rq_end(proc);
+				}
+				else if (proc->status == PROC_EXITED) {
+				}
+
+			}
+		}
+		else if (proc->status == PROC_STOPPED) {
+			proc->status = PROC_RUNNING;
+			running_proc = proc;
+			kill(proc->pid, SIGCONT);
+
+			nanosleep(&req, &rem);
+			if (proc->status == PROC_RUNNING) {
+				kill(proc->pid, SIGSTOP);
+				proc_to_rq_end(proc);
+				proc->status = PROC_STOPPED;
+			}
+			else if (proc->status == PROC_EXITED) {
+			}
+
+		}
+		else if (proc->status == PROC_EXITED) {
+			printf("process has exited\n");
+		}
+		else if (proc->status == PROC_RUNNING) {
+			printf("WARNING: Already running process\n");
+		}
+		else {
+			err_exit("Unknown process status");
+		}
+	}
+}

@@ -1,0 +1,446 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define MAX_LINE_LENGTH 80
+
+
+#define PROC_NEW 0
+#define PROC_STOPPED 1
+#define PROC_RUNNING 2
+#define PROC_EXITED 3
+#define PROC_IO 4     // Για μερος Β 
+#define FCFS 0
+#define RR 1
+
+
+
+typedef struct proc_desc {
+	struct proc_desc *next;
+	char name[80];
+	int pid;
+	int status;
+	double t_submission, t_handler, t_end;
+} proc_t;
+
+struct single_queue {
+	proc_t	*first;
+	proc_t	*last;
+	long members;
+};
+
+struct single_queue global_q;
+struct  single_queue io_q;  
+int policy = FCFS;
+int quantum = 100;	
+proc_t *running_proc;
+double global_t;
+sigset_t block_mask;
+
+
+
+void fcfs();
+void rr();
+void sigusr1_handler(int signo, siginfo_t *info, void *context); 
+void sigusr2_handler(int signo, siginfo_t *info, void *context); 
+void sigchld_handler(int signo, siginfo_t *info, void *context);
+proc_t* find_proc_by_pid(int pid);
+
+
+#define proc_queue_empty(q) ((q)->first==NULL)
+
+
+void proc_queue_init (register struct single_queue * q)
+{
+	q->first = q->last = NULL;
+	q->members = 0;
+}
+
+void proc_to_rq (register proc_t *proc)
+{
+	if (proc_queue_empty (&global_q))
+		global_q.last = proc;
+	proc->next = global_q.first;
+	global_q.first = proc;
+}
+
+void proc_to_rq_end (register proc_t *proc)
+{
+	if (proc_queue_empty (&global_q))
+		global_q.first = global_q.last = proc;
+	else {
+		global_q.last->next = proc;
+		global_q.last = proc;
+		proc->next = NULL;
+	}
+}
+
+proc_t *proc_rq_dequeue ()
+{
+	register proc_t *proc;
+
+	proc = global_q.first;
+	if (proc==NULL) return NULL;
+
+	proc = global_q.first;
+	if (proc!=NULL) {
+		global_q.first = proc->next;
+		proc->next = NULL;
+	}
+
+	return proc;
+}
+
+//ΨΑχνω την διεργασια απο το PID τησ ειτε στη τρεχουσα διεργσια ειτε σε μια απο τισ δυο ουρεσ
+proc_t* find_proc_by_pid(int pid) {
+    proc_t *curr;
+
+    
+    if (running_proc != NULL && running_proc->pid == pid) {
+        return running_proc;
+    }
+
+    
+    curr = global_q.first;
+    while (curr != NULL) {
+        if (curr->pid == pid) return curr;
+        curr = curr->next;
+    }
+
+    curr = io_q.first;
+    while (curr != NULL) {
+        if (curr->pid == pid) return curr;
+        curr = curr->next;
+    }
+
+    return NULL; 
+}
+
+void print_queue()
+{
+	proc_t *proc;
+
+	proc = global_q.first;
+	while (proc != NULL) {
+		printf("proc: [name:%s pid:%d]\n", 
+			proc->name, proc->pid);
+		proc = proc->next;
+	}
+}
+
+double proc_gettime()
+{
+	struct timeval tv;
+	gettimeofday(&tv, 0);
+	return (double) (tv.tv_sec+tv.tv_usec/1000000.0);
+}
+
+void err_exit(char *msg)
+{
+	printf("Error: %s\n", msg);
+	exit(1);
+}
+
+void signals_setup() {
+    struct sigaction sa;
+    
+   
+    sigfillset(&sa.sa_mask); 
+    
+    sa.sa_flags = SA_SIGINFO | SA_RESTART| SA_NOCLDSTOP;
+
+    sa.sa_sigaction = sigusr1_handler;
+    if (sigaction(SIGUSR1, &sa, NULL) == -1) err_exit("sigaction SIGUSR1");
+
+    sa.sa_sigaction = sigusr2_handler;
+    if (sigaction(SIGUSR2, &sa, NULL) == -1) err_exit("sigaction SIGUSR2");
+
+    sa.sa_sigaction = sigchld_handler;
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) err_exit("sigaction SIGCHLD");
+
+    
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGUSR1);
+    sigaddset(&block_mask, SIGUSR2);
+    sigaddset(&block_mask, SIGCHLD);
+}
+
+void sigusr1_handler(int signo, siginfo_t *info, void *context) {
+    int sender_pid = info->si_pid; 
+
+    if (running_proc != NULL && running_proc->pid == sender_pid) {
+        running_proc->status = PROC_IO; 
+        
+        
+        if (io_q.first == NULL) {
+            io_q.first = running_proc;
+            io_q.last = running_proc;
+        } else {
+            io_q.last->next = running_proc;
+            io_q.last = running_proc;
+        }
+        running_proc->next = NULL;
+        running_proc = NULL;
+    }
+}
+
+
+void sigusr2_handler(int signo, siginfo_t *info, void *context) {
+    int sender_pid = info->si_pid;
+    proc_t *curr = io_q.first;
+    proc_t *prev = NULL;
+
+    
+    while (curr != NULL) {
+        if (curr->pid == sender_pid) {
+            
+            if (prev == NULL) {
+                io_q.first = curr->next;
+                if (io_q.first == NULL) io_q.last = NULL;
+            } else {
+                prev->next = curr->next;
+                if (curr == io_q.last) io_q.last = prev;
+            }
+
+           
+            curr->status = PROC_STOPPED; 
+            curr->next = NULL;
+            
+            proc_to_rq_end(curr); 
+            return;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+   
+}
+void sigchld_handler(int signo, siginfo_t *info, void *context) {
+    pid_t pid;
+    int status;
+    
+    
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (running_proc != NULL && running_proc->pid == pid) {
+            running_proc->status = PROC_EXITED; 
+            running_proc->t_end = proc_gettime();
+            
+            printf("PID %d - CMD: %s\n", running_proc->pid, running_proc->name);
+            printf("\tElapsed time = %.2lf secs\n", running_proc->t_end - running_proc->t_submission);
+            printf("\tWorkload time = %.2lf secs\n", running_proc->t_end - global_t);
+            
+            running_proc = NULL;
+        }
+    }
+}
+
+int main(int argc,char **argv)
+{
+	FILE *input;
+	char exec[80];
+    char trigger[80]; 
+    int priority;
+	int c;
+	proc_t *proc;
+    //arxikopoioume tis oures
+    proc_queue_init(&global_q);
+    proc_queue_init(&io_q);
+//elenxoume ta orismata apo thngrammi entolon
+	if (argc == 1) {
+		err_exit("invalid usage");
+	} else if (argc == 2) {
+		input = fopen(argv[1],"r");
+		if (input == NULL) err_exit("invalid input file name");
+	} else if (argc > 2) {
+        //edv ginetai h epilogh FCFS h RR
+		if (!strcmp(argv[1],"FCFS")) {
+			policy = FCFS;
+			input = fopen(argv[2],"r");
+			if (input == NULL) err_exit("invalid input file name");
+		} else if (!strcmp(argv[1],"RR")) {
+			policy = RR;
+			quantum = atoi(argv[2]);
+			input = fopen(argv[3],"r");
+			if (input == NULL) err_exit("invalid input file name");
+		} else {
+			err_exit("invalid usage");
+		}
+	}
+
+	//anagnosi tou arxeiou kai dimioyrgite lista diergasion
+	while ((c=fscanf(input, "%s", exec))!=EOF) {
+		
+		
+		proc = malloc(sizeof(proc_t));
+		proc->next = NULL;
+		strcpy(proc->name, exec);
+		proc->pid = -1;
+		proc->status = PROC_NEW;
+		proc->t_submission = proc_gettime();
+		proc_to_rq_end(proc);
+	}
+
+//jekinaei na metraei
+  	global_t = proc_gettime();
+    //jekinaei o algorithmos poy epilejame
+	switch (policy) {
+		case FCFS:
+			fcfs();
+			break;
+
+		case RR:
+			rr();
+			break;
+
+		default:
+			err_exit("Unimplemented policy");
+			break;
+	}
+
+	printf("WORKLOAD TIME: %.2lf secs\n", proc_gettime()-global_t);
+	printf("scheduler exits\n");
+	return 0;
+}
+
+
+void fcfs() {
+    proc_t *proc;
+    int pid;
+//energopoioyme ta shmata
+    signals_setup();
+
+    sigset_t empty_mask;
+    sigemptyset(&empty_mask);
+//trexei oso exoyme diergasies
+    while (running_proc != NULL || !proc_queue_empty(&global_q) || !proc_queue_empty(&io_q)) {
+        
+     //mplokaroume ta simata etsi vste na diaxeiristoume ayta poy yparxoyn stis oures
+        sigprocmask(SIG_BLOCK, &block_mask, NULL);
+//an yparxei diergasia sthn oura pou einai se anamoni kai cpu eleftheros
+        if (running_proc == NULL && !proc_queue_empty(&global_q)) {
+            proc = proc_rq_dequeue();
+            running_proc = proc;
+
+            if (proc->status == PROC_NEW) {
+                proc->t_handler = proc_gettime();
+                pid = fork();
+                
+                if (pid == -1) err_exit("fork failed");
+
+                if (pid == 0) { //gia to paidi
+                   //epanaferoume ta shmata
+                    sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+                    execl(proc->name, proc->name, NULL);
+                    exit(1);
+                } else { //gia patera
+                    proc->pid = pid;
+                    proc->status = PROC_RUNNING;
+                    printf("Process %s handlered (PID: %d)\n", proc->name, pid);
+                }
+            } else if (proc->status == PROC_STOPPED) {
+                kill(proc->pid, SIGCONT);
+                proc->status = PROC_RUNNING;
+                printf("Resuming process %s (PID: %d)\n", proc->name, proc->pid);
+            }
+        }
+//an den exoyme kati h perimenoume gia input/output koimomaste kai perimenoume shma
+      
+        if (running_proc != NULL || !proc_queue_empty(&io_q)) {
+            sigsuspend(&empty_mask); 
+        }
+
+       //jemplokaroume ta shmata
+        sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
+    }
+}
+
+
+void rr() {
+    proc_t *proc;
+    int pid;
+    struct timespec req;
+    struct sigaction sa;
+    sigset_t empty_mask; 
+
+   //metatrepv ms se sec/nsec
+    req.tv_sec = quantum / 1000;
+    req.tv_nsec = (quantum % 1000) * 1000000;
+
+    printf("DEBUG: RR Policy handlered with Quantum: %d ms\n", quantum);
+
+  
+    signals_setup();
+    
+    sigemptyset(&empty_mask);
+
+  
+    while (running_proc != NULL || !proc_queue_empty(&global_q) || !proc_queue_empty(&io_q)) {
+
+        
+        sigprocmask(SIG_BLOCK, &block_mask, NULL);
+//an dne etrexei kaia diergasia 
+        if (running_proc == NULL) {
+            
+       //exv diathesimi diergasia sthn oura Ready
+            if (!proc_queue_empty(&global_q)) {
+                proc = proc_rq_dequeue();
+                running_proc = proc;
+
+                if (proc->status == PROC_NEW) {
+                    printf("executing %s\n", proc->name);
+                    proc->t_handler = proc_gettime();
+                    pid = fork();
+
+                    if (pid == -1) err_exit("fork failed");
+
+                    if (pid == 0) {//gia to paidi
+                      
+                        sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+                        execl(proc->name, proc->name, NULL);
+                        exit(1);
+                    } else {  //gia ton patera
+                        proc->pid = pid;
+                        proc->status = PROC_RUNNING;
+                    }
+                } else if (proc->status == PROC_STOPPED) {
+                    kill(proc->pid, SIGCONT);
+                    proc->status = PROC_RUNNING;
+                }
+            } 
+            //an h ready einia adeia alla exv sthn io
+            else if (!proc_queue_empty(&io_q)) {
+              
+                sigsuspend(&empty_mask);
+        
+                sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
+                continue; 
+            }
+        }
+//2.yparxei energh diergasia
+        if (running_proc != NULL) {
+            
+       //apeleftheronoume simata kai koimomaste gia quantum    
+            sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+            nanosleep(&req, NULL);
+           //mplokaroume jana gia elenxo
+            sigprocmask(SIG_BLOCK, &block_mask, NULL);
+
+    //an exv akoma diergasia 
+            if (running_proc != NULL) {
+                kill(running_proc->pid, SIGSTOP);
+                running_proc->status = PROC_STOPPED;
+            //bale sto telos tis ouras
+                proc_to_rq_end(running_proc);
+                running_proc = NULL;
+            }
+        }
+
+       
+        sigprocmask(SIG_UNBLOCK, &block_mask, NULL);
+    }
+}
